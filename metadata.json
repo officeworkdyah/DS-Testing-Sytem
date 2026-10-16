@@ -1,0 +1,6 @@
+{
+  "name": "AgenKompeten DS",
+  "description": "Aplikasi tes penempatan level Data Science berbasis Gemini dan SKKNI No. 299/2020 dengan AI Agent penyusun soal otomatis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
