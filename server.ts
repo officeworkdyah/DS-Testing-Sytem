@@ -42,6 +42,10 @@ async function generateContentWithRetry(params: any): Promise<any> {
   if (!primaryQuotaExhausted) modelsToTry.push(PRIMARY_MODEL);
   if (!fallbackQuotaExhausted) modelsToTry.push(FALLBACK_MODEL);
 
+  if (!apiKey || apiKey.trim() === '') {
+    throw new Error('ApiKeyMissing');
+  }
+
   if (modelsToTry.length === 0) {
     throw new Error('QuotaExhausted');
   }
@@ -1033,6 +1037,11 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Gagal menjalankan server:', err);
-});
+if (!process.env.VERCEL && !process.env.NOW_REGION) {
+  startServer().catch((err) => {
+    console.error('Gagal menjalankan server:', err);
+  });
+}
+
+export default app;
+
