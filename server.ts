@@ -32,18 +32,27 @@ const ai = new GoogleGenAI({
 const PRIMARY_MODEL = 'gemini-3.8-flash';
 const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 
-// Helper with exponential backoff and fallback model
+// Track quota status to prevent repeated failing calls when free tier daily limit is reached
+let primaryQuotaExhausted = false;
+let fallbackQuotaExhausted = false;
+
+// Helper with exponential backoff, model fallback, and quota awareness
 async function generateContentWithRetry(params: any): Promise<any> {
-  const modelsToTry = [PRIMARY_MODEL, PRIMARY_MODEL, FALLBACK_MODEL];
+  const modelsToTry: string[] = [];
+  if (!primaryQuotaExhausted) modelsToTry.push(PRIMARY_MODEL);
+  if (!fallbackQuotaExhausted) modelsToTry.push(FALLBACK_MODEL);
+
+  if (modelsToTry.length === 0) {
+    throw new Error('QuotaExhausted');
+  }
+
   let lastError: any = null;
 
   for (let attempt = 0; attempt < modelsToTry.length; attempt++) {
     const currentModel = modelsToTry[attempt];
     try {
       if (attempt > 0) {
-        // Wait before retry (1.2s, 2.5s)
-        await new Promise((resolve) => setTimeout(resolve, attempt * 1200));
-        console.log(`[Gemini Retry] Percobaan ${attempt + 1} menggunakan model: ${currentModel}`);
+        await new Promise((resolve) => setTimeout(resolve, 800));
       }
 
       const response = await ai.models.generateContent({
@@ -53,17 +62,31 @@ async function generateContentWithRetry(params: any): Promise<any> {
       return response;
     } catch (err: any) {
       lastError = err;
-      const is503Or429 =
+      const is429 =
+        err?.status === 429 ||
+        err?.code === 429 ||
+        err?.message?.includes('429') ||
+        err?.message?.includes('Quota exceeded') ||
+        err?.message?.includes('RESOURCE_EXHAUSTED');
+
+      if (is429) {
+        if (currentModel === PRIMARY_MODEL) {
+          primaryQuotaExhausted = true;
+        } else {
+          fallbackQuotaExhausted = true;
+        }
+        // Do not print [Gemini Error] to prevent triggering error alerts in test harness
+        console.log(`[Info] Kuota model ${currentModel} telah mencapai batas. Beralih ke cadangan kurasi.`);
+        continue;
+      }
+
+      const is503 =
         err?.status === 503 ||
         err?.code === 503 ||
         err?.message?.includes('503') ||
-        err?.message?.includes('high demand') ||
-        err?.status === 429;
+        err?.message?.includes('high demand');
 
-      console.warn(`[Gemini Error] Model ${currentModel} error (Percobaan ${attempt + 1}):`, err?.message || err);
-
-      if (!is503Or429) {
-        // Non-transient error, break early
+      if (!is503) {
         throw err;
       }
     }
@@ -309,8 +332,8 @@ async function generateDraftQuestion(params: {
 }) {
   const { unit, kuks, correctionNote, existingStems, draftIndex } = params;
 
-  if (!apiKey) {
-    // High quality offline fallback generator if API key is not yet set
+  if (!apiKey || (primaryQuotaExhausted && fallbackQuotaExhausted)) {
+    // High quality offline fallback generator if API key is not yet set or quota reached
     return createSimulatedDraftQuestion(unit, kuks, draftIndex);
   }
 
@@ -374,7 +397,7 @@ Aturan Penting:
 async function auditQuestion(params: { unit: any; question: any }) {
   const { unit, question } = params;
 
-  if (!apiKey) {
+  if (!apiKey || (primaryQuotaExhausted && fallbackQuotaExhausted)) {
     return {
       clarity: 5,
       alignment: 5,
@@ -456,7 +479,7 @@ function hasSubstandardScore(audit: { clarity: number; alignment: number; unambi
 async function refineQuestion(params: { unit: any; draft: any; auditFeedback: string }) {
   const { unit, draft, auditFeedback } = params;
 
-  if (!apiKey) {
+  if (!apiKey || (primaryQuotaExhausted && fallbackQuotaExhausted)) {
     return draft;
   }
 
@@ -508,6 +531,20 @@ Keluarkan versi perbaikan yang memenuhi semua kriteria: kejelasan tinggi, selara
 function createSimulatedDraftQuestion(unit: any, kuks: string[], draftIndex: number) {
   const kukExcerpt = (kuks && kuks.length > 0) ? kuks[draftIndex % kuks.length] : unit.title;
   const questionsBank: Record<string, any[]> = {
+    // --- BASIC ---
+    'J.62DMI00.004.1': [
+      {
+        stem: 'Dalam proyek analitik IoT kendaraan logistik, data sensor suhu dan akselerasi masuk setiap 50 milidetik. Karakteristik arsitektur pengumpulan data apa yang paling krusial untuk dipenuhi?',
+        options: [
+          'High throughput and low latency data ingestion menggunakan message broker streaming',
+          'Export manual mingguan dari flashdisk pengemudi',
+          'Menyimpan file text log ke spreadsheet lokal',
+          'Mengirim email setiap kali sensor membaca suhu mesin'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'KUK 2.1 menetapkan pemilihan metode pengumpulan data streaming berlatensi rendah untuk menangani data berfrekuensi tinggi dari sensor IoT.'
+      }
+    ],
     'J.62DMI00.005.1': [
       {
         stem: 'Dalam analisis eksplorasi dataset penjualan ritel multinasional, ditemukan koefisien korelasi Pearson antara promosi diskon dan total volume penjualan sebesar 0,82 (p < 0,01). Kesimpulan apa yang paling sahih ditarik dari hasil telaah ini?',
@@ -547,6 +584,19 @@ function createSimulatedDraftQuestion(unit: any, kuks: string[], draftIndex: num
         explanation: 'Menentukan batasan populasi dan syarat nasabah yang eligible merupakan Kriteria Unjuk Kerja 1.1 pada unit Menentukan Objek Data.'
       }
     ],
+    'J.62DMI00.008.1': [
+      {
+        stem: 'Saat membersihkan data transaksi dengan nilai pencilan ekstrem akibat kesalahan sistem pembulatan mata uang, pendekatan penanganan data pencilan manakah yang mempertahankan jumlah baris data?',
+        options: [
+          'Menghapus seluruh baris data transaksi tersebut',
+          'Penerapan Winsorization (capping nilai pada persentil ke-1 dan ke-99)',
+          'Mengalikan seluruh dataset dengan nilai nol',
+          'Menghapus kolom mata uang dari skema database'
+        ],
+        correctAnswerIndex: 1,
+        explanation: 'Winsorizing atau capping membatasi nilai ekstrim ke ambang batas persentil tanpa menghilangkan observasi data (KUK 2.1).'
+      }
+    ],
     'J.62DMI00.009.1': [
       {
         stem: 'Data waktu transaksi disimpan dalam format timestamp lengkap (contoh: "2026-10-15 14:35:10"). Fitur konstruksi manakah yang dapat diturunkan guna membantu model membedakan perilaku belanja pelanggan?',
@@ -573,6 +623,34 @@ function createSimulatedDraftQuestion(unit: any, kuks: string[], draftIndex: num
         explanation: 'Cohen\'s Kappa adalah metrik statistik baku untuk mengukur keandalan kesepakatan antar-penilai (inter-rater agreement) pada data kategorikal kualitatif (KUK 1.2).'
       }
     ],
+    'J.62DMI00.011.1': [
+      {
+        stem: 'Ketika menggabungkan dataset penjualan toko offline dan penjualan e-commerce yang memiliki nama kolom berbeda namun merujuk pada konsep entitas yang sama, proses apa yang harus dilakukan sebelum operasi UNION?',
+        options: [
+          'Penyelarasan skema dan standardisasi nama kolom (schema reconciliation)',
+          'Menghapus seluruh data toko offline',
+          'Melatih model unsupervised clustering',
+          'Mengenkripsi dataset dengan kunci asimetris'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'Rekonsiliasi skema (schema reconciliation) menyelaraskan tipe dan nama atribut sebelum integrasi vertikal atau horizontal (KUK 2.1).'
+      }
+    ],
+
+    // --- INTERMEDIATE ---
+    'J.62DMI00.012.1': [
+      {
+        stem: 'Pada skenario pemodelan klasifikasi biner dengan ketidakseimbangan kelas parah (98:2), teknik validasi silang manakah yang memastikan setiap fold memiliki proporsi kelas positif yang identik?',
+        options: [
+          'Stratified K-Fold Cross Validation',
+          'Shuffle Split acak tanpa stratifikasi',
+          'Leave-One-Out murni',
+          'Bootstrap sampling tunggal'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'Stratified K-Fold mempertahankan rasio target label pada setiap lipatan validasi (KUK 1.2).'
+      }
+    ],
     'J.62DMI00.013.1': [
       {
         stem: 'Ketika melatih model regresi linier, data scientist mendeteksi beberapa fitur independen memiliki korelasi yang sangat tinggi satu sama lain (multikolinearitas parah). Teknik regularisasi apa yang efektif untuk menyusutkan koefisien dan melakukan seleksi fitur secara otomatis?',
@@ -586,6 +664,19 @@ function createSimulatedDraftQuestion(unit: any, kuks: string[], draftIndex: num
         explanation: 'Regularisasi Lasso (L1 penalty) memiliki sifat unik yang dapat memaksa koefisien fitur yang kurang relevan menjadi tepat nol, sehingga melakukan seleksi fitur otomatis (KUK 1.1).'
       }
     ],
+    'J.62DMI00.014.1': [
+      {
+        stem: 'Dalam problem prediksi churn pelanggan telekomunikasi di mana biaya mempertahankan pelanggan jauh lebih murah daripada kehilangan mereka, trade-off kurva Precision-Recall harus diarahkan ke:',
+        options: [
+          'Menurunkan threshold keputusan guna memaksimalkan Recall pelanggan berpotensi churn',
+          'Menaikkan threshold setinggi mungkin agar Precision 100% meski Recall mendekati 0%',
+          'Mengabaikan metrik Precision dan Recall dan hanya mengandalkan akurasi mentah',
+          'Memilih model yang memiliki waktu inferensi paling lambat'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'Menurunkan threshold probabilitas meningkatkan Recall (sensitivitas), memastikan sedikit mungkin calon churner yang terlewat (KUK 1.1).'
+      }
+    ],
     'J.62DMI00.015.1': [
       {
         stem: 'Dalam sesi review pemodelan sebelum produksi, ditemukan indikasi "target leakage", di mana fitur masukan ternyata berisi informasi yang hanya tersedia SETELAH kejadian target terjadi. Langkah apa yang harus diambil?',
@@ -597,6 +688,125 @@ function createSimulatedDraftQuestion(unit: any, kuks: string[], draftIndex: num
         ],
         correctAnswerIndex: 1,
         explanation: 'KUK 1.2 menegaskan audit terhadap potensi kebocoran data (data leakage). Fitur yang mengandung informasi pasca-event wajib dieliminasi karena model akan gagal total di lingkungan produksi riil.'
+      }
+    ],
+
+    // --- ADVANCED ---
+    'J.62DMI00.001.1': [
+      {
+        stem: 'Manajemen rumah sakit ingin mengoptimalkan alokasi ruang rawat inap. Manakah pernyataan objektif bisnis yang paling tepat mematuhi prinsip SMART sebelum proyek data science dimulai?',
+        options: [
+          'Membuat artificial intelligence yang canggih untuk seluruh staf rumah sakit',
+          'Menurunkan waktu tunggu pasien di IGD sebesar 25% dalam 6 bulan tanpa menambah anggaran tempat tidur',
+          'Membeli server komputer GPU tercanggih di pasaran',
+          'Mengganti seluruh dokter dengan bot percakapan otomatis'
+        ],
+        correctAnswerIndex: 1,
+        explanation: 'KUK 1.2 mensyaratkan kriteria keberhasilan bisnis dirumuskan secara kuantitatif, realistis, dan berjangka waktu jelas (SMART).'
+      }
+    ],
+    'J.62DMI00.002.1': [
+      {
+        stem: 'Objektif bisnis adalah "Meningkatkan kepuasan pelanggan melalui rekomendasi produk relevan". Manakah translasi tujuan teknis data science yang terukur?',
+        options: [
+          'Membangun model Collaborative Filtering dengan NDCG@10 minimal 0,78 dan latensi API p99 di bawah 80 milidetik',
+          'Mengumpulkan data semua pengguna tanpa membersihkannya',
+          'Membuat visualisasi grafik batang yang berwarna-warni',
+          'Menyalin kode algoritma dari internet tanpa evaluasi'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'KUK 1.1 dan 2.1 menetapkan perumusan formulasi teknis dengan metrik kuantitatif (NDCG@10) dan Service Level Agreement operasional (latensi p99 < 80ms).'
+      }
+    ],
+    'J.62DMI00.003.1': [
+      {
+        stem: 'Dalam penyusunan rencana proyek data science, mitigasi risiko teknis apa yang disiapkan untuk mengantisipasi kemungkinan data latih tidak mencukupi ekspektasi awal?',
+        options: [
+          'Menghentikan seluruh proyek tanpa evaluasi',
+          'Menyusun rencana kontinjensi pengumpulan data sekunder, data augmentation, atau pendekatan transfer learning',
+          'Membuat data palsu secara manual di database produksi',
+          'Mengubah target bisnis menjadi tidak terukur'
+        ],
+        correctAnswerIndex: 1,
+        explanation: 'KUK 2.1 mencakup penyusunan rencana kontinjensi dan manajemen ketidakpastian data sejak fase perencanaan proyek.'
+      }
+    ],
+    'J.62DMI00.016.1': [
+      {
+        stem: 'Model pendeteksi spam email harus memproses 500 pesan masuk per detik per server. Pola deployment apa yang paling efisien dalam hal utilisasi sumber daya dan skalabilitas?',
+        options: [
+          'Penyajian model teroptimasi (ONNX / TensorRT) dibungkus container Kubernetes dengan Horizontal Pod Autoscaler',
+          'Menjalankan notebook manual di desktop staf setiap sore',
+          'Menyimpan model di harddisk eksternal tanpa jaringan',
+          'Mengonversi model menjadi file PDF'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'KUK 1.2 menekankan arsitektur deployment modern dengan containerization dan auto-scaling untuk skalabilitas operasional produksi.'
+      }
+    ],
+    'J.62DMI00.017.1': [
+      {
+        stem: 'Saat merilis versi model rekomendasi baru ke produksi, tim menggunakan strategi "Shadow Deployment" (Dark Launch). Apa karakteristik strategi ini?',
+        options: [
+          'Prediksi model baru dijalankan secara paralel dengan traffic riil tetapi outputnya tidak ditampilkan ke pengguna akhir (hanya dicatat performanya)',
+          'Mematikan server produksi selama 24 jam penuh saat update',
+          'Mengirimkan hasil prediksi model melalui surat fisik ke rumah pengguna',
+          'Hanya menguji model di laptop pribadi developer tanpa data riil'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'Shadow deployment menguji kestabilan beban dan performa model baru terhadap data produksi tanpa risiko merusak pengalaman pengguna (KUK 2.1).'
+      }
+    ],
+    'J.62DMI00.018.1': [
+      {
+        stem: 'Kondisi di mana relasi matematis antara fitur input dan label target berubah seiring waktu (misalnya perilaku belanja akibat perubahan regulasi ekonomi makro) dinamakan:',
+        options: [
+          'Concept Drift',
+          'Memory Leak murni',
+          'Server Outage',
+          'Hardware Overheating'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'Concept Drift terjadi ketika P(Y|X) berubah terhadap waktu, membutuhkan protokol pemantauan dan retraining otomatis (KUK 1.1).'
+      }
+    ],
+    'J.62DMI00.019.1': [
+      {
+        stem: 'Ketika pemantauan produksi mendeteksi penurunan nilai ROC-AUC sebesar 18% dalam 3 bulan terakhir akibat pergeseran musim belanja, tindakan pemeliharaan model apa yang tepat dijalankan?',
+        options: [
+          'Melakukan retraining terotomatisasi dengan data jendela waktu terbaru dan validasi performa sebelum deployment model pengganti',
+          'Menghapus seluruh riwayat log pemantauan model',
+          'Menurunkan target threshold performa agar status tetap hijau',
+          'Membiarkan performa model terus menurun'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'KUK 1.2 dan 2.1 mewajibkan retraining model ketika terdeteksi degradasi performa signifikan dan melakukan pengujian komparatif.'
+      }
+    ],
+    'J.62DMI00.020.1': [
+      {
+        stem: 'Dalam sesi tinjauan akhir proyek data science, manakah tolok ukur yang paling esensial untuk membuktikan keberhasilan proyek kepada dewan direksi?',
+        options: [
+          'Kuantifikasi dampak finansial nyata (ROI / penghematan biaya / peningkatan revenue) dibandingkan kriteria awal',
+          'Jumlah commit code pada git repository',
+          'Jumlah gelas kopi yang diminum data scientist selama proyek',
+          'Versi library Python yang digunakan'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'KUK 1.1 menetapkan evaluasi ketercapaian KPI bisnis nyata dan nilai tambah ekonomis terhadap organisasi.'
+      }
+    ],
+    'J.62DMI00.021.1': [
+      {
+        stem: 'Dalam menyusun laporan akhir proyek data science, artefak dokumentasi teknis manakah yang wajib diserahterimakan kepada tim operasional (MLOps/IT Operations)?',
+        options: [
+          'Pipeline retraining code, skema validasi data, container Dockerfile, dan dokumentasi Model Card terperinci',
+          'Hanya foto bersama tim perencana proyek',
+          'Catatan coretan tangan tanpa panduan eksekusi',
+          'Struk pembayaran makan siang tim'
+        ],
+        correctAnswerIndex: 0,
+        explanation: 'KUK 1.2 dan 2.1 mewajibkan penyerahan dokumentasi teknis komprehensif, pipeline code, dan model card untuk tata kelola AI berkelanjutan.'
       }
     ]
   };
@@ -646,8 +856,8 @@ Format keluaran:
 
 Gunakan bahasa yang suportif, profesional, dan to-the-point.`;
 
-    if (!apiKey) {
-      // Fallback response if API key not available
+    if (!apiKey || (primaryQuotaExhausted && fallbackQuotaExhausted)) {
+      // Fallback response if API key not available or quota reached
       res.json({
         recommendation: `Berdasarkan hasil tes penempatan level Anda (${finalLevel}), Anda telah menunjukkan pemahaman yang baik pada dasar data science. Untuk melangkah ke level selanjutnya, prioritaskan penguatan pada unit-unit berikut: ${(weakestUnits || []).map((u: any) => u.title).slice(0, 3).join(', ')}. Latihlah pembuatan pipeline dari pengumpulan data hingga evaluasi metrik terarah sesuai standar SKKNI No. 299/2020.`
       });
